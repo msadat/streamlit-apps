@@ -7,7 +7,6 @@
 # Recommended packages:
 #   pip install streamlit pandas numpy plotly openpyxl
 
-import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,6 +24,7 @@ st.set_page_config(
 )
 
 st.title("FAA Runway Longitudinal and Transverse Grade Compliance Checker")
+
 st.caption(
     "Screen runway surface grades using 25-ft station and offset elevation data. "
     "Criteria are based on FAA AC 150/5300-13B runway geometric design standards."
@@ -39,22 +39,29 @@ def generate_station_values(runway_length_ft: float, interval_ft: float = 25.0) 
     """Generate longitudinal station array from 0 to runway length."""
     stations = np.arange(0, runway_length_ft + interval_ft, interval_ft)
     stations = stations[stations <= runway_length_ft]
+
     if len(stations) == 0 or stations[-1] < runway_length_ft:
         stations = np.append(stations, runway_length_ft)
+
     return stations
 
 
 def generate_offset_values(runway_width_ft: float, interval_ft: float = 25.0) -> np.ndarray:
     """Generate transverse offset array from -width/2 to +width/2."""
     half_width = runway_width_ft / 2.0
+
     offsets = np.arange(-half_width, half_width + interval_ft, interval_ft)
     offsets = offsets[(offsets >= -half_width) & (offsets <= half_width)]
+
+    if len(offsets) == 0:
+        offsets = np.array([-half_width, 0.0, half_width])
+
     if offsets[0] > -half_width:
         offsets = np.insert(offsets, 0, -half_width)
+
     if offsets[-1] < half_width:
         offsets = np.append(offsets, half_width)
 
-    # Force centerline offset = 0 if not already present
     if not np.any(np.isclose(offsets, 0.0)):
         offsets = np.sort(np.append(offsets, 0.0))
 
@@ -64,23 +71,22 @@ def generate_offset_values(runway_width_ft: float, interval_ft: float = 25.0) ->
 def create_blank_elevation_grid(runway_length_ft: float, runway_width_ft: float) -> pd.DataFrame:
     """
     Create editable grid where rows are longitudinal stations and columns are transverse offsets.
-    Default starter values use a simple crowned runway with mild longitudinal grade.
+    Default starter values use a crowned runway with mild longitudinal grade.
     """
     stations = generate_station_values(runway_length_ft)
     offsets = generate_offset_values(runway_width_ft)
 
     base_elev = 600.00
-    longitudinal_grade = 0.002  # 0.20%
-    crown_cross_slope = 0.0125  # 1.25%
+    longitudinal_grade_decimal = 0.0020   # 0.20%
+    crown_cross_slope_decimal = 0.0125    # 1.25%
 
     data = {"Station_ft": stations}
 
     for offset in offsets:
-        # Crown at centerline. Edges lower than centerline.
         elevation = (
             base_elev
-            + longitudinal_grade * stations
-            - crown_cross_slope * np.abs(offset)
+            + longitudinal_grade_decimal * stations
+            - crown_cross_slope_decimal * np.abs(offset)
         )
         data[f"{offset:.2f}"] = np.round(elevation, 3)
 
@@ -88,23 +94,33 @@ def create_blank_elevation_grid(runway_length_ft: float, runway_width_ft: float)
 
 
 def parse_uploaded_grid(uploaded_file) -> pd.DataFrame:
-    """Read CSV or Excel file into dataframe."""
+    """Read uploaded CSV or Excel file."""
     filename = uploaded_file.name.lower()
+
     if filename.endswith(".csv"):
         return pd.read_csv(uploaded_file)
+
     if filename.endswith(".xlsx") or filename.endswith(".xls"):
         return pd.read_excel(uploaded_file)
-    raise ValueError("Unsupported file type. Please upload CSV or Excel.")
+
+    raise ValueError("Unsupported file type. Please upload a CSV, XLSX, or XLS file.")
 
 
 def clean_elevation_grid(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean and validate grid.
+    Clean and validate the elevation grid.
+
     Required format:
       First column: Station_ft
-      Remaining columns: transverse offsets in feet, such as -75, -50, -25, 0, 25, 50, 75
+      Remaining columns: transverse offsets in feet.
+
+    Example:
+      Station_ft, -75, -50, -25, 0, 25, 50, 75
     """
     df = df.copy()
+
+    if df.empty:
+        raise ValueError("The elevation grid is empty.")
 
     if "Station_ft" not in df.columns:
         first_col = df.columns[0]
@@ -114,10 +130,15 @@ def clean_elevation_grid(df: pd.DataFrame) -> pd.DataFrame:
 
     offset_cols = [c for c in df.columns if c != "Station_ft"]
 
+    if len(offset_cols) < 2:
+        raise ValueError("At least two transverse offset columns are required.")
+
     new_cols = {"Station_ft": "Station_ft"}
+
     for col in offset_cols:
         try:
-            offset_value = float(str(col).replace("ft", "").replace("'", "").strip())
+            cleaned = str(col).replace("ft", "").replace("'", "").strip()
+            offset_value = float(cleaned)
             new_cols[col] = f"{offset_value:.2f}"
         except Exception:
             raise ValueError(
@@ -129,49 +150,53 @@ def clean_elevation_grid(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["Station_ft"]).sort_values("Station_ft").reset_index(drop=True)
+    df = df.dropna(subset=["Station_ft"])
+    df = df.sort_values("Station_ft").reset_index(drop=True)
+
+    if len(df) < 2:
+        raise ValueError("At least two longitudinal stations are required.")
 
     return df
 
 
 def get_offset_columns(df: pd.DataFrame) -> list:
-    """Return offset columns sorted numerically."""
+    """Return transverse offset columns sorted numerically."""
     offset_cols = [c for c in df.columns if c != "Station_ft"]
-    offset_cols = sorted(offset_cols, key=lambda x: float(x))
-    return offset_cols
+    return sorted(offset_cols, key=lambda x: float(x))
 
 
 def nearest_column(offset_cols: list, target_offset: float) -> str:
-    """Find offset column nearest to a target offset."""
+    """Find offset column nearest to target offset."""
     offsets = np.array([float(c) for c in offset_cols])
-    idx = np.argmin(np.abs(offsets - target_offset))
+    idx = int(np.argmin(np.abs(offsets - target_offset)))
     return offset_cols[idx]
 
 
 def compute_segment_grades(stations: np.ndarray, elevations: np.ndarray) -> pd.DataFrame:
-    """Compute longitudinal segment grades between adjacent stations."""
+    """Compute longitudinal grades between adjacent stations."""
     rows = []
 
     for i in range(len(stations) - 1):
-        x1 = stations[i]
-        x2 = stations[i + 1]
-        z1 = elevations[i]
-        z2 = elevations[i + 1]
-        dx = x2 - x1
+        s1 = stations[i]
+        s2 = stations[i + 1]
+        e1 = elevations[i]
+        e2 = elevations[i + 1]
+        ds = s2 - s1
 
-        if dx == 0:
+        if ds == 0:
             grade_pct = np.nan
         else:
-            grade_pct = 100.0 * (z2 - z1) / dx
+            grade_pct = 100.0 * (e2 - e1) / ds
 
         rows.append(
             {
                 "Segment": i + 1,
-                "Start Station ft": x1,
-                "End Station ft": x2,
-                "Start Elev ft": z1,
-                "End Elev ft": z2,
-                "Segment Length ft": dx,
+                "Start Station ft": s1,
+                "End Station ft": s2,
+                "Segment Midpoint ft": (s1 + s2) / 2.0,
+                "Start Elev ft": e1,
+                "End Elev ft": e2,
+                "Segment Length ft": ds,
                 "Longitudinal Grade %": grade_pct,
                 "Abs Grade %": abs(grade_pct) if pd.notna(grade_pct) else np.nan,
             }
@@ -181,10 +206,28 @@ def compute_segment_grades(stations: np.ndarray, elevations: np.ndarray) -> pd.D
 
 
 def compute_grade_changes(grade_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute grade change between consecutive longitudinal grade segments."""
+    """
+    Compute change in longitudinal grade between adjacent sampled segments.
+
+    Note:
+    This is a screening check from 25-ft sampled data.
+    Final design should use actual PVI locations and vertical curve lengths.
+    """
     rows = []
+
+    if len(grade_df) < 2:
+        return pd.DataFrame(
+            columns=[
+                "PVI Approx Station ft",
+                "Incoming Grade %",
+                "Outgoing Grade %",
+                "Grade Change %",
+                "Abs Grade Change %",
+            ]
+        )
+
     grades = grade_df["Longitudinal Grade %"].to_numpy()
-    stations = grade_df["End Station ft"].to_numpy()
+    pvi_stations = grade_df["End Station ft"].to_numpy()
 
     for i in range(len(grades) - 1):
         g1 = grades[i]
@@ -193,7 +236,7 @@ def compute_grade_changes(grade_df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append(
             {
-                "PVI Approx Station ft": stations[i],
+                "PVI Approx Station ft": pvi_stations[i],
                 "Incoming Grade %": g1,
                 "Outgoing Grade %": g2,
                 "Grade Change %": delta_g,
@@ -204,15 +247,11 @@ def compute_grade_changes(grade_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_transverse_grades(df: pd.DataFrame, crown_offset_ft: float) -> pd.DataFrame:
+def compute_transverse_grades(df: pd.DataFrame, crown_offset_ft: float):
     """
-    Compute transverse grades from crown to each offset for each station.
+    Compute transverse drainage slope from crown to each offset.
 
-    Convention:
-    - Crown elevation should be higher than edge elevation for normal crowned drainage.
-    - Left side: offset < crown offset
-    - Right side: offset > crown offset
-    - Report positive drainage slope away from crown.
+    Positive value means elevation drops away from the crown.
     """
     offset_cols = get_offset_columns(df)
     crown_col = nearest_column(offset_cols, crown_offset_ft)
@@ -226,18 +265,17 @@ def compute_transverse_grades(df: pd.DataFrame, crown_offset_ft: float) -> pd.Da
 
         for col in offset_cols:
             offset = float(col)
+
             if np.isclose(offset, crown_actual):
                 continue
 
-            z = row[col]
+            z_point = row[col]
             distance = abs(offset - crown_actual)
 
             if distance == 0:
                 continue
 
-            # Positive drainage slope means elevation drops away from crown.
-            drainage_slope_pct = 100.0 * (z_crown - z) / distance
-
+            drainage_slope_pct = 100.0 * (z_crown - z_point) / distance
             side = "Left of Crown" if offset < crown_actual else "Right of Crown"
 
             rows.append(
@@ -247,7 +285,7 @@ def compute_transverse_grades(df: pd.DataFrame, crown_offset_ft: float) -> pd.Da
                     "Side": side,
                     "Crown Offset Used ft": crown_actual,
                     "Crown Elev ft": z_crown,
-                    "Point Elev ft": z,
+                    "Point Elev ft": z_point,
                     "Distance From Crown ft": distance,
                     "Transverse Drainage Slope %": drainage_slope_pct,
                     "Abs Transverse Slope %": abs(drainage_slope_pct),
@@ -262,8 +300,21 @@ def classify_longitudinal_compliance(
     grade_change_df: pd.DataFrame,
     runway_length_ft: float,
     aircraft_approach_category: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Apply FAA longitudinal grade compliance checks."""
+):
+    """
+    Apply FAA runway longitudinal grade screening criteria.
+
+    Criteria included in this app:
+    - AAC A/B: max longitudinal grade = 2.0%
+    - AAC C/D/E: max longitudinal grade = 1.5%
+    - AAC C/D/E runway ends: max grade = 0.8% in first/last quarter or 2,500 ft, whichever is less
+    - Grade change screening:
+        A/B = 2.0%
+        C/D/E = 1.5%
+    """
+    grade_df = grade_df.copy()
+    grade_change_df = grade_change_df.copy()
+
     if aircraft_approach_category in ["A", "B"]:
         max_long_grade_pct = 2.0
         max_grade_change_pct = 2.0
@@ -275,10 +326,8 @@ def classify_longitudinal_compliance(
         end_zone_limit_pct = 0.8
         end_zone_length_ft = min(runway_length_ft / 4.0, 2500.0)
 
-    grade_df = grade_df.copy()
-    grade_change_df = grade_change_df.copy()
-
     grade_df["Max Allowed Grade %"] = max_long_grade_pct
+
     grade_df["Longitudinal Grade Compliance"] = np.where(
         grade_df["Abs Grade %"] <= max_long_grade_pct,
         "PASS",
@@ -286,17 +335,12 @@ def classify_longitudinal_compliance(
     )
 
     if end_zone_limit_pct is not None:
-        start_end_zone = end_zone_length_ft
-        far_end_zone_start = runway_length_ft - end_zone_length_ft
-
-        # Segment is considered in end zone if its midpoint falls inside either controlled zone.
-        grade_df["Segment Midpoint ft"] = (
-            grade_df["Start Station ft"] + grade_df["End Station ft"]
-        ) / 2.0
+        first_end_zone_limit = end_zone_length_ft
+        last_end_zone_start = runway_length_ft - end_zone_length_ft
 
         grade_df["Inside C/D/E End Zone"] = (
-            (grade_df["Segment Midpoint ft"] <= start_end_zone)
-            | (grade_df["Segment Midpoint ft"] >= far_end_zone_start)
+            (grade_df["Segment Midpoint ft"] <= first_end_zone_limit)
+            | (grade_df["Segment Midpoint ft"] >= last_end_zone_start)
         )
 
         grade_df["End Zone Max Allowed Grade %"] = np.where(
@@ -311,19 +355,20 @@ def classify_longitudinal_compliance(
             "N/A",
         )
     else:
-        grade_df["Segment Midpoint ft"] = (
-            grade_df["Start Station ft"] + grade_df["End Station ft"]
-        ) / 2.0
         grade_df["Inside C/D/E End Zone"] = False
         grade_df["End Zone Max Allowed Grade %"] = np.nan
         grade_df["C/D/E End Zone Compliance"] = "N/A"
 
-    grade_change_df["Max Allowed Grade Change %"] = max_grade_change_pct
-    grade_change_df["Grade Change Compliance"] = np.where(
-        grade_change_df["Abs Grade Change %"] <= max_grade_change_pct,
-        "PASS",
-        "FAIL",
-    )
+    if grade_change_df.empty:
+        grade_change_df["Max Allowed Grade Change %"] = []
+        grade_change_df["Grade Change Compliance"] = []
+    else:
+        grade_change_df["Max Allowed Grade Change %"] = max_grade_change_pct
+        grade_change_df["Grade Change Compliance"] = np.where(
+            grade_change_df["Abs Grade Change %"] <= max_grade_change_pct,
+            "PASS",
+            "FAIL",
+        )
 
     criteria = {
         "max_long_grade_pct": max_long_grade_pct,
@@ -340,8 +385,14 @@ def classify_transverse_compliance(
     min_transverse_pct: float,
     max_transverse_pct: float,
 ) -> pd.DataFrame:
-    """Apply transverse slope compliance checks."""
+    """Apply transverse slope screening criteria."""
     trans_df = trans_df.copy()
+
+    if trans_df.empty:
+        trans_df["Min Allowed Transverse Slope %"] = []
+        trans_df["Max Allowed Transverse Slope %"] = []
+        trans_df["Transverse Slope Compliance"] = []
+        return trans_df
 
     trans_df["Min Allowed Transverse Slope %"] = min_transverse_pct
     trans_df["Max Allowed Transverse Slope %"] = max_transverse_pct
@@ -357,18 +408,38 @@ def classify_transverse_compliance(
 
 
 def summarize_pass_fail(label: str, status_series: pd.Series) -> dict:
-    """Summarize PASS/FAIL counts."""
+    """Summarize PASS/FAIL/N/A counts."""
+    if status_series.empty:
+        return {
+            "Check": label,
+            "PASS Count": 0,
+            "FAIL Count": 0,
+            "N/A Count": 0,
+            "Overall": "N/A",
+        }
+
+    pass_count = int((status_series == "PASS").sum())
+    fail_count = int((status_series == "FAIL").sum())
+    na_count = int((status_series == "N/A").sum())
+
+    overall = "FAIL" if fail_count > 0 else "PASS"
+
     return {
         "Check": label,
-        "PASS Count": int((status_series == "PASS").sum()),
-        "FAIL Count": int((status_series == "FAIL").sum()),
-        "N/A Count": int((status_series == "N/A").sum()),
-        "Overall": "PASS" if not (status_series == "FAIL").any() else "FAIL",
+        "PASS Count": pass_count,
+        "FAIL Count": fail_count,
+        "N/A Count": na_count,
+        "Overall": overall,
     }
 
 
 def style_pass_fail(df: pd.DataFrame):
-    """Apply simple Streamlit dataframe styling."""
+    """
+    Apply PASS/FAIL/N/A styling.
+
+    This version works with newer pandas versions where Styler.applymap()
+    has been replaced by Styler.map().
+    """
     def color_status(val):
         if val == "PASS":
             return "background-color: #d8f3dc; color: #1b4332;"
@@ -378,11 +449,22 @@ def style_pass_fail(df: pd.DataFrame):
             return "background-color: #eeeeee; color: #555555;"
         return ""
 
-    return df.style.applymap(color_status)
+    styler = df.style
+
+    # pandas >= 2.1 uses Styler.map()
+    if hasattr(styler, "map"):
+        return styler.map(color_status)
+
+    # older pandas fallback
+    return styler.applymap(color_status)
 
 
-def plot_longitudinal_profile(grade_df: pd.DataFrame, stations: np.ndarray, elevations: np.ndarray):
-    """Plot centerline longitudinal profile and grade segments."""
+def plot_longitudinal_profile(
+    grade_df: pd.DataFrame,
+    stations: np.ndarray,
+    elevations: np.ndarray,
+):
+    """Plot centerline longitudinal profile."""
     fig = go.Figure()
 
     fig.add_trace(
@@ -396,6 +478,7 @@ def plot_longitudinal_profile(grade_df: pd.DataFrame, stations: np.ndarray, elev
     )
 
     fail_segments = grade_df[grade_df["Longitudinal Grade Compliance"] == "FAIL"]
+
     for _, row in fail_segments.iterrows():
         fig.add_vrect(
             x0=row["Start Station ft"],
@@ -430,16 +513,28 @@ def plot_centerline_grade(grade_df: pd.DataFrame, criteria: dict):
     )
 
     max_g = criteria["max_long_grade_pct"]
-    fig.add_hline(y=max_g, line_dash="dash", annotation_text=f"+{max_g:.2f}% limit")
-    fig.add_hline(y=-max_g, line_dash="dash", annotation_text=f"-{max_g:.2f}% limit")
+
+    fig.add_hline(
+        y=max_g,
+        line_dash="dash",
+        annotation_text=f"+{max_g:.2f}% longitudinal limit",
+    )
+
+    fig.add_hline(
+        y=-max_g,
+        line_dash="dash",
+        annotation_text=f"-{max_g:.2f}% longitudinal limit",
+    )
 
     if criteria["end_zone_limit_pct"] is not None:
         end_g = criteria["end_zone_limit_pct"]
+
         fig.add_hline(
             y=end_g,
             line_dash="dot",
             annotation_text=f"+{end_g:.2f}% C/D/E end-zone limit",
         )
+
         fig.add_hline(
             y=-end_g,
             line_dash="dot",
@@ -456,7 +551,7 @@ def plot_centerline_grade(grade_df: pd.DataFrame, criteria: dict):
     return fig
 
 
-def plot_transverse_profiles(df: pd.DataFrame, selected_stations: list[float]):
+def plot_transverse_profiles(df: pd.DataFrame, selected_stations: list):
     """Plot transverse elevation profiles at selected stations."""
     offset_cols = get_offset_columns(df)
     offsets = np.array([float(c) for c in offset_cols])
@@ -490,6 +585,7 @@ def plot_transverse_profiles(df: pd.DataFrame, selected_stations: list[float]):
 def plot_surface_3d(df: pd.DataFrame):
     """Plot runway elevation surface."""
     offset_cols = get_offset_columns(df)
+
     x = df["Station_ft"].to_numpy(dtype=float)
     y = np.array([float(c) for c in offset_cols])
     z = df[offset_cols].to_numpy(dtype=float).T
@@ -560,7 +656,7 @@ crown_offset_ft = st.sidebar.number_input(
     max_value=runway_width_ft / 2.0,
     value=0.0,
     step=1.0,
-    help="Use 0 ft for normal centerline crown. Use another value for off-center crown.",
+    help="Use 0 ft for normal centerline crown. Use another value for an off-center crown.",
 )
 
 st.sidebar.header("Transverse Slope Criteria")
@@ -581,6 +677,10 @@ max_transverse_pct = st.sidebar.number_input(
     step=0.1,
 )
 
+if max_transverse_pct < min_transverse_pct:
+    st.sidebar.error("Maximum transverse slope must be greater than or equal to minimum transverse slope.")
+    st.stop()
+
 st.sidebar.header("Data Input")
 
 input_method = st.sidebar.radio(
@@ -592,6 +692,7 @@ input_method = st.sidebar.radio(
 )
 
 uploaded_file = None
+
 if input_method == "Upload CSV or Excel grid":
     uploaded_file = st.sidebar.file_uploader(
         "Upload runway elevation grid",
@@ -611,8 +712,11 @@ st.subheader("1. Elevation Input Grid")
 
 st.markdown(
     """
-Enter elevations in **feet**. Rows are longitudinal stations. Columns are transverse offsets.
-The default grid is generated at approximately **25-ft intervals** in both directions.
+Enter elevations in **feet**.
+
+- Rows are longitudinal stations.
+- Columns are transverse offsets.
+- The generated template uses approximately **25-ft intervals** in both directions.
 """
 )
 
@@ -641,14 +745,6 @@ except Exception as e:
 
 offset_cols = get_offset_columns(runway_df)
 
-if len(runway_df) < 2:
-    st.error("At least two longitudinal stations are required.")
-    st.stop()
-
-if len(offset_cols) < 2:
-    st.error("At least two transverse offset columns are required.")
-    st.stop()
-
 centerline_col = nearest_column(offset_cols, 0.0)
 crown_col = nearest_column(offset_cols, crown_offset_ft)
 
@@ -658,6 +754,7 @@ st.info(
 )
 
 template_csv = convert_df_to_csv(create_blank_elevation_grid(runway_length_ft, runway_width_ft))
+
 st.download_button(
     label="Download blank/sample elevation template CSV",
     data=template_csv,
@@ -719,9 +816,9 @@ summary_df = pd.DataFrame(summary_rows)
 
 st.subheader("2. Compliance Summary")
 
-col1, col2, col3, col4 = st.columns(4)
+overall_status = "FAIL" if (summary_df["Overall"] == "FAIL").any() else "PASS"
 
-overall_status = "PASS" if not (summary_df["Overall"] == "FAIL").any() else "FAIL"
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric("Overall Screening Result", overall_status)
@@ -747,8 +844,10 @@ with col4:
         f"{min_transverse_pct:.2f}% to {max_transverse_pct:.2f}%",
     )
 
-st.dataframe(style_pass_fail(summary_df), use_container_width=True)
-
+st.dataframe(
+    style_pass_fail(summary_df),
+    use_container_width=True,
+)
 
 if overall_status == "FAIL":
     st.warning(
@@ -793,13 +892,16 @@ with plot_tab2:
 with plot_tab3:
     available_stations = runway_df["Station_ft"].to_list()
 
-    default_station_choices = [
-        available_stations[0],
-        available_stations[len(available_stations) // 4],
-        available_stations[len(available_stations) // 2],
-        available_stations[3 * len(available_stations) // 4],
-        available_stations[-1],
-    ]
+    if len(available_stations) >= 5:
+        default_station_choices = [
+            available_stations[0],
+            available_stations[len(available_stations) // 4],
+            available_stations[len(available_stations) // 2],
+            available_stations[3 * len(available_stations) // 4],
+            available_stations[-1],
+        ]
+    else:
+        default_station_choices = available_stations
 
     selected_stations = st.multiselect(
         "Select stations for transverse profile plotting",
@@ -823,7 +925,7 @@ with plot_tab4:
 
 
 # ============================================================
-# Detailed tables
+# Detailed compliance tables
 # ============================================================
 
 st.subheader("4. Detailed Compliance Tables")
@@ -843,6 +945,7 @@ with table_tab1:
         "Segment",
         "Start Station ft",
         "End Station ft",
+        "Segment Midpoint ft",
         "Start Elev ft",
         "End Elev ft",
         "Segment Length ft",
@@ -904,7 +1007,7 @@ with table_tab3:
 
 
 # ============================================================
-# Professional reference / formula section
+# Professional reference and formula section
 # ============================================================
 
 st.subheader("5. FAA References, Equations, and Design Notes")
@@ -915,16 +1018,17 @@ with st.expander("Show FAA references and formulas", expanded=True):
         """
 ### Primary FAA Reference
 
-**FAA AC 150/5300-13B, Airport Design**  
-Use the current FAA-published edition and any applicable changes/errata for final design decisions.
+**FAA AC 150/5300-13B, Airport Design**
 
-This app screens the following:
+Use the current FAA-published edition and any applicable changes, errata, project-specific FAA comments, and sponsor standards for final design decisions.
+
+This app screens:
 
 1. Centerline longitudinal grade.
 2. Longitudinal grade changes between adjacent sampled segments.
 3. C/D/E end-zone grade limits.
-4. Transverse drainage slopes from the runway crown.
-5. Centerline and transverse profile visualization.
+4. Transverse drainage slopes from runway crown.
+5. Centerline, transverse, and 3D surface profiles.
 
 ---
 """
@@ -944,9 +1048,9 @@ This app screens the following:
         """
 Where:
 
-- \(G_i\) = longitudinal grade of segment \(i\), percent  
-- \(E_i\) = elevation at station \(i\), ft  
-- \(S_i\) = longitudinal station \(i\), ft  
+- \(G_i\) = longitudinal grade of segment \(i\), percent
+- \(E_i\) = elevation at station \(i\), ft
+- \(S_i\) = longitudinal station \(i\), ft
 """
     )
 
@@ -968,13 +1072,13 @@ Where:
         """
 Where:
 
-- \(\Delta G_i\) = change in longitudinal grade between adjacent segments, percent  
-- \(G_i\) = incoming segment grade, percent  
-- \(G_{i+1}\) = outgoing segment grade, percent  
-- \(\Delta G_{\max}\) = FAA maximum allowable grade change, percent  
+- \(\Delta G_i\) = change in longitudinal grade between adjacent segments, percent
+- \(G_i\) = incoming segment grade, percent
+- \(G_{i+1}\) = outgoing segment grade, percent
+- \(\Delta G_{\max}\) = maximum allowable grade change, percent
 
 For discrete 25-ft survey data, this app approximates grade changes between adjacent sampled segments.
-For final design, verify true PVI locations, vertical curves, and FAA vertical-curve length requirements.
+For final design, verify actual PVI locations, vertical curves, sight-distance criteria, and FAA vertical-curve length requirements.
 """
     )
 
@@ -995,8 +1099,10 @@ For final design, verify true PVI locations, vertical curves, and FAA vertical-c
 
         st.markdown(
             """
-For **Aircraft Approach Category A or B**, this app uses a maximum runway longitudinal grade of
-\(\pm 2.0\%\) and a maximum grade change of \(\pm 2.0\%\).
+For **Aircraft Approach Category A or B**, this app uses:
+
+- Maximum runway longitudinal grade: \(\pm 2.0\%\)
+- Maximum longitudinal grade change: \(\pm 2.0\%\)
 """
         )
 
@@ -1033,7 +1139,7 @@ For **Aircraft Approach Category C, D, or E**, this app uses:
 - Maximum runway longitudinal grade: \(\pm 1.5\%\)
 - Maximum grade in the first and last controlled end zone: \(\pm 0.8\%\)
 - Controlled end-zone length: lesser of first/last quarter of runway length or first/last 2,500 ft
-- Maximum allowable grade change: \(\pm 1.5\%\)
+- Maximum allowable longitudinal grade change: \(\pm 1.5\%\)
 """
         )
 
@@ -1052,17 +1158,23 @@ For **Aircraft Approach Category C, D, or E**, this app uses:
         """
 Where:
 
-- \(X_j\) = transverse drainage slope from crown to offset point \(j\), percent  
-- \(E_{\mathrm{crown}}\) = runway crown elevation, ft  
-- \(E_j\) = elevation at transverse offset \(j\), ft  
-- \(O_{\mathrm{crown}}\) = crown offset, ft  
-- \(O_j\) = transverse offset of point \(j\), ft  
+- \(X_j\) = transverse drainage slope from crown to offset point \(j\), percent
+- \(E_{\mathrm{crown}}\) = runway crown elevation, ft
+- \(E_j\) = elevation at transverse offset \(j\), ft
+- \(O_{\mathrm{crown}}\) = crown offset, ft
+- \(O_j\) = transverse offset of point \(j\), ft
 
-Positive \(X_j\) indicates the surface drains away from the crown.
+Positive \(X_j\) means the pavement surface drains away from the crown.
 """
     )
 
     st.markdown("### FAA Transverse Grade Screening Criteria Used")
+
+    st.latex(
+        r"""
+        X_{\min} \leq X_j \leq X_{\max}
+        """
+    )
 
     st.latex(
         r"""
@@ -1072,8 +1184,8 @@ Positive \(X_j\) indicates the surface drains away from the crown.
 
     st.markdown(
         """
-This app checks runway pavement transverse drainage slope from the crown against the selected range.
-The default range is \(1.0\%\) to \(1.5\%\), consistent with FAA AC 150/5300-13B runway transverse slope guidance.
+The default transverse runway pavement slope range used in this app is \(1.0\%\) to \(1.5\%\).
+The input boxes allow you to adjust this range if project-specific criteria require different limits.
 """
     )
 
@@ -1082,11 +1194,11 @@ The default range is \(1.0\%\) to \(1.5\%\), consistent with FAA AC 150/5300-13B
     st.markdown(
         """
 - This tool is intended for **screening and design review**, not final FAA certification.
-- The app assumes the uploaded elevations represent the runway pavement surface.
+- The app assumes uploaded elevations represent the runway pavement surface.
 - The centerline profile is taken from the transverse offset closest to 0 ft.
 - The crown elevation is taken from the transverse offset closest to the user-selected crown offset.
 - For off-center crown sections, confirm that the crown location and drainage intent match the actual design.
-- For final compliance, verify vertical curve geometry, line-of-sight, runway safety area grading, runway shoulder grading, pavement smoothness, and project-specific FAA coordination requirements.
+- For final compliance, verify vertical curve geometry, line-of-sight, runway safety area grading, runway shoulder grading, pavement smoothness, tie-ins, survey control, and FAA coordination requirements.
 """
     )
 
@@ -1099,5 +1211,5 @@ st.divider()
 
 st.caption(
     "Developed as an engineering screening tool for runway grade compliance review. "
-    "Always verify against the current FAA AC 150/5300-13B and project-specific FAA approvals."
+    "Always verify against the current FAA AC 150/5300-13B, project-specific FAA comments, and Engineer-of-Record requirements."
 )

@@ -1212,5 +1212,5 @@ st.divider()
 st.caption(
     "Developed as an engineering screening tool for runway grade compliance review. "
     "Always verify against the current FAA AC 150/5300-13B, project-specific FAA comments, and Engineer-of-Record requirements."
-    "Copyright - Rafat Sadat"
+    " Copyright by Rafat Sadat."
 )
